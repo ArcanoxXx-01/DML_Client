@@ -31,75 +31,142 @@ El sistema utiliza una arquitectura modular y desacoplada basada en dos tipos de
 
 ## Workers:
 
-Los nodos Worker son responsables de procesar las peticiones de los usuarios y ejecutar las tareas de entrenamiento y predicción de los modelos.
+Los nodos Worker son responsables de procesar las peticiones de los usuarios y ejecutar las tareas de entrenamiento y predicción de los modelos. Cada Worker es una instancia del backend (`dml-service`) que expone una API REST construida con FastAPI.
 
 Cada Worker funciona de forma totalmente independiente, sin necesidad de comunicarse ni coordinarse con otros Workers. Su única interacción es con los nodos DataBase, que actúan como fuente de datos y como mecanismo de control del trabajo distribuido.
 
+
 ## Procesos de los Workers:
 
-Cada worker realiza 4 tipos de procesos distintos:
+Cada Worker ejecuta 4 tipos de procesos distintos:
 
-### 1. REST:
+### 1. REST (API Endpoints):
 
-Son los procesos detrás de cada endpoint que expone en su API. Se encargan de procesar las peticiones que reciben de los clientes, inicializando datos y realizando las peticiones necesarias sobre los nodos DataBases.
+Procesos que manejan las peticiones HTTP a través de los endpoints definidos en `app/api/endpoints/`. Se encargan de:
 
-### 2. GET_MODEL:
+- **`/training/train`**: Crear sesiones de entrenamiento, generar `training_id` único e inicializar modelos en background
+- **`/predictions/predict`**: Registrar sesiones de predicción para un modelo y dataset
+- **`/datasets`**: Gestionar datasets disponibles
+- **`/model_registry`**: Consultar información de modelos
+- **`/health`**: Verificar el estado del Worker
+- **`/leader/*`**: Endpoints para elección de líder entre Workers (`/compare`, `/announce`, `/get`, `/start-election`)
 
-Proceso que constantemente verifica si tiene disponibilidad para entrenar o predecir parte de un modelo y en caso de tener le pide a un nodo **DataBase** un modelo a entrenar o predecir, además de los metadatos necesarios para cumplir la tarea (**batch, tipo de modelo, parámetros actuales, tipo de proceso**, etc). 
+Estos endpoints procesan las peticiones de los clientes, validan los datos de entrada mediante esquemas Pydantic (`app/schemas/`), y realizan las operaciones necesarias sobre los nodos DataBase a través del `DatabaseManager`.
 
-Una vez tiene los datos necesarios inicia un proceso de **Training/Prediction** según sea necesario. Dicho proceso se ejecuta de manera independiente.
+### 2. GET_MODEL (Polling de Tareas):
 
-### 3. Training/Prediction:
+Proceso implementado en la clase `Runner` (`app/models/runner.py`) que ejecuta un hilo de polling continuo mediante el método `_poll_for_models()`. Su funcionamiento:
 
-Realiza una iteración del entrenamiento del modelo o la predicción sobre el batch de datos con que se inicializó, manda a actualizar los resultados o parámetros del modelo a uno de los DataBases activos. 
+1. Verifica si hay capacidad disponible (controlado por `MAX_CONCURRENT_RUNNING_MODELS`)
+2. Llama a `database_manager.get_model_to_run()` para obtener modelos disponibles
+3. Recibe un objeto `ModelToRun` con:
+   - **`model_id`**: Identificador del modelo
+   - **`running_type`**: Tipo de tarea (`training` o `prediction`)
+   - **`dataset_id`**: Dataset asociado
+4. Inicia la ejecución del modelo mediante `_start_model_execution()`
+5. Limpia modelos completados con `_cleanup_completed_models()`
 
-### 4. Descubrimiento:
+El polling se ejecuta cada **2 segundos**.
 
-Hilo que se encargan de saber que nodos DataBase están activos a través del DNS.
+### 3. Training/Prediction (Ejecución de ML):
 
-Este hilo mantiene una tabla con todos los nodos del sistemas (incluso los que no están activos), y a cada uno le asocia una variable booleana que muestra si está o no activo en la misma red.
+Procesos gestionados por la clase `Runner` que crea dos hilos por cada modelo:
 
-Por otra parte cada vez que le realiza una petición a un nodo DataBase actualiza el estado del mismo según si le respondió o no.
+**Hilo de Ejecución (`_run_model`):**
+- Obtiene los datos completos del modelo desde el DataBase
+- Instancia la clase del modelo correspondiente (ej: `RandomForestClassifierModel`)
+- Deserializa el estado previo del modelo
+- Ejecuta `_execute_training()` o `_execute_prediction()` según el `running_type`
+- Serializa y guarda los resultados
 
+**Hilo de Status (`_send_status_notifications`):**
+- Envía heartbeats cada **10 segundos** mediante `database_manager.send_model_running_status()`
+- Se detiene cuando el hilo de ejecución termina
 
-## Tolerancia a fallas de los Workers:
-Los workers no conocen ni necesitan conocer la existencia de otros workers.
-No comparten estado ni intercambian mensajes.
+Las clases de modelos heredan de `MLModel` (`app/models/ml_model.py`) e implementan los métodos `train()`, `predict()`, `serialize()` y `deserialize()`.
 
-Esta independencia permite escalar horizontalmente simplemente agregando nuevos nodos, y a demás garantiza una tolerancia a fallas de K-1, donde K es a la cantidad de Workers que hay activos en la red. Además garantiza que no ocurran fallas ante particiones y reconexiones  de red siempre que exista un worker activo.
+### 4. Descubrimiento (Discovery):
+
+Hilo implementado en la clase `Middleware` (`app/middleware/middleware.py`) mediante el método `_discover_ips()`:
+
+- Se inicia con `start_monitoring()` al arrancar la aplicación
+- Ejecuta `_refresh_service_ip_cache()` cada **10 segundos**
+- Resuelve IPs mediante DNS con `_resolve_domain_ips()`
+- Mantiene un `ip_cache` con todos los nodos descubiertos
+- Verifica la salud de cada IP con `check_ip_alive()` haciendo peticiones a `/api/v1/health`
+- Elimina IPs que no responden del caché
+- Usa `cache_lock` (threading.Lock) para acceso thread-safe al caché
+
+## Tolerancia a Fallas de los Workers:
+
+Los Workers están diseñados con total independencia:
+
+- **No conocen** la existencia de otros Workers
+- **No comparten estado** ni intercambian mensajes entre sí
+- **No requieren coordinación** directa
+
+### Garantías:
+
+| Característica | Descripción |
+|----------------|-------------|
+| **Escalabilidad Horizontal** | Agregar nuevos Workers sin cambios de configuración |
+| **Tolerancia a Fallas** | K-1, donde K es la cantidad de Workers activos |
+| **Resistencia a Particiones** | El sistema funciona mientras exista al menos un Worker activo |
+| **Recuperación Automática** | Workers pueden reconectarse sin intervención manual |
 
 ## Coordinación entre Workers:
 
-Para evitar que dos workers en la misma red entrenen o predigan sobre el mismo modelo al mismo tiempo, el sistema utiliza un mecanismo de heartbeat basado en un campo llamado ***health***, almacenado en los nodos DataBase.
+Para evitar que dos Workers procesen el mismo modelo simultáneamente, el sistema utiliza un mecanismo de **heartbeat** basado en el campo `health` almacenado en los nodos DataBase.
 
-### Su funcionamiento es el siguiente:
+### Funcionamiento del Mecanismo:
+┌─────────────┐ ┌─────────────┐
+│ Worker │ │ DataBase │
+│ (Runner) │ │ │
+└──────┬──────┘ └──────┬──────┘
+│ │
+│ 1. get_model_to_run() │
+│ (health > 20 segundos) │
+│───────────────────────────────────>│
+│ │
+│ 2. ModelToRun(model_id, │
+│ running_type, dataset_id) │
+│<───────────────────────────────────│
+│ │
+│ 3. send_model_running_status() │
+│ (cada 10s desde status thread) │
+│───────────────────────────────────>│
+│ │
+│ 4. Actualiza health = now() │
+│ │
+
+### Etapas del Proceso:
 
 1. **Selección del modelo disponible**:
+   - Los nodos DataBase registran el `health` (timestamp) de cada modelo
+   - El método `get_model_to_run()` retorna modelos cuyo `health` sea mayor a **20 segundos** (modelo libre o abandonado)
 
-    - Los nodos DataBase llevan un registro del health de cada modelo.
-    - Un worker puede solicitar al DataBase un modelo cuyo health sea de hace más de 20 segundos (Ese modelo se considera libre o abandonado).
-
-2. **Heartbeat del worker**:
-
-    - Una vez que un worker toma un modelo, envía cada 10 segundos una señal al DataBase informando que sigue activo.
-    - El DataBase actualiza (health = instante_actual) en los dueños del dato.
+2. **Heartbeat del Worker**:
+   - El hilo `_send_status_notifications()` envía señales cada **10 segundos**
+   - Llama a `database_manager.send_model_running_status(model_id, dataset_id)`
+   - El DataBase actualiza: `health = timestamp_actual`
 
 3. **Detección de fallo o abandono**:
-
-    - Si no se recibe un heartbeat en más de 20 segundos, el DataBase considera que el worker presentó algún tipo de error.
-    - Ese modelo vuelve a estar disponible para que otro worker lo tome.
+   - Si no se recibe heartbeat en más de **20 segundos**, el modelo se considera abandonado
+   - El modelo queda disponible para reasignación
 
 4. **Reasignación automática**:
-
-    - Cualquier worker que pida un modelo libre podrá tomarlo inmediatamente.
-    - No se necesitan bloqueos distribuidos ni coordinación entre workers.
+   - Cualquier Worker puede tomar un modelo libre inmediatamente
+   - No requiere bloqueos distribuidos ni coordinación entre Workers
 
 ### Ventajas del Mecanismo:
 
-- Evita conflictos: ningún modelo será entrenado por dos workers simultáneamente.
-- Alta disponibilidad: si un worker se cae, el trabajo se reasigna automáticamente.
-- Escalabilidad simple: más workers = más capacidad de entrenamiento sin cambios estructurales.
-- Desacoplamiento total: la lógica distribuida se delega a los nodos DataBase mediante el campo health.
+| Ventaja | Descripción |
+|---------|-------------|
+| **Sin conflictos** | Ningún modelo será procesado por dos Workers simultáneamente |
+| **Alta disponibilidad** | Si un Worker falla, el trabajo se reasigna automáticamente |
+| **Escalabilidad simple** | Más Workers = más capacidad sin cambios estructurales |
+| **Desacoplamiento total** | La lógica distribuida se delega a los nodos DataBase |
+| **Sin bloqueos distribuidos** | El campo `health` elimina la necesidad de locks complejos |
 
 
 ## DataBases:
