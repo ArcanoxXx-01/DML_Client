@@ -404,15 +404,5 @@ El sistema está diseñado para operar en entornos inestables, asumiendo que los
 - **Nodos Nuevos**: Se integran automáticamente al ser descubiertos por el DNS/Gossip, recibiendo metadatos y participando eventualmente en el almacenamiento de nuevas réplicas.
 
 ## Seguridad
-
-### Seguridad en la Comunicación
-- **Protocolo**: Actualmente la comunicación es HTTP plano. En entornos de producción, se recomienda el despliegue detrás de un proxy inverso o malla de servicios que provea terminación TLS/SSL para cifrar el tráfico entre nodos.
-- **Aislamiento de Red**: El diseño asume que el tráfico entre Workers y DataBases ocurre dentro de una red privada confiable (ej. red overlay de Docker Swarm), no expuesta directamente a internet pública.
-
 ### Seguridad del Diseño
 - **Validación de Datos**: Todos los endpoints utilizan esquemas Pydantic estrictos para validar la estructura y tipos de datos de entrada, previniendo inyección de datos malformados.
-- **Sin Ejecución de Código Remoto**: El sistema transfiere datos y modelos serializados (JSON/CSV), no código ejecutable arbitrario (como pickles de Python inseguros), mitigando riesgos de RCE.
-
-### Autorización y Autenticación
-- **Estado Actual**: El sistema opera bajo un modelo de confianza total dentro del clúster. No implementa autenticación (tokens/usuarios) entre servicios internos.
-- **Control de Acceso**: La seguridad perimetral debe ser gestionada por la infraestructura (firewalls, security groups). El acceso de usuarios finales a la API pública debería ser mediado por un API Gateway que maneje la autenticación.
