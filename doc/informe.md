@@ -119,25 +119,29 @@ Los Workers están diseñados con total independencia:
 Para evitar que dos Workers procesen el mismo modelo simultáneamente, el sistema utiliza un mecanismo de **heartbeat** basado en el campo `health` almacenado en los nodos DataBase.
 
 ### Funcionamiento del Mecanismo:
-┌─────────────┐ ┌─────────────┐
-│ Worker │ │ DataBase │
-│ (Runner) │ │ │
-└──────┬──────┘ └──────┬──────┘
-│ │
-│ 1. get_model_to_run() │
-│ (health > 20 segundos) │
-│───────────────────────────────────>│
-│ │
-│ 2. ModelToRun(model_id, │
-│ running_type, dataset_id) │
-│<───────────────────────────────────│
-│ │
-│ 3. send_model_running_status() │
-│ (cada 10s desde status thread) │
-│───────────────────────────────────>│
-│ │
-│ 4. Actualiza health = now() │
-│ │
+
+
+```
+┌─────────────┐                      ┌─────────────┐
+│   Worker    │                      │  DataBase   │
+│  (Runner)   │                      │             │
+└──────┬──────┘                      └──────┬──────┘
+       │                                    │
+       │  1. get_model_to_run()             │
+       │  (health > 20 segundos)            │
+       │───────────────────────────────────>│
+       │                                    │
+       │  2. ModelToRun(model_id,           │
+       │     running_type, dataset_id)      │
+       │<───────────────────────────────────│
+       │                                    │
+       │  3. send_model_running_status()    │
+       │     (cada 10s desde status thread) │
+       │───────────────────────────────────>│
+       │                                    │
+       │  4. Actualiza health = now()       │
+       │                                    │
+```
 
 ### Etapas del Proceso:
 
@@ -177,121 +181,238 @@ Cada DataBase expone una API REST para responder a las solicitudes que reciben d
 
 Cada nodo mantiene su propio almacenamiento, procesa consultas de lectura y escritura, y participa en el mecanismo de replicación distribuida para lograr la consistencia del sistema.
 
-### Procesos de los DataBases:
+## Procesos
 
-Los DataBase realizan 5 procesos distintos:
+Cada nodo DataBase ejecuta varios procesos concurrentes para mantener el sistema funcionando:
 
-#### 1. RESTs: 
+### 1. REST API (Servidor Principal)
+Expone endpoints para interactuar con Workers y otros nodos DataBase:
+- **`/datasets`**: Subida (con particionado en batches) y descarga de datasets.
+- **`/models`**: Registro de modelos, consulta de tareas pendientes (`/torun`), y actualizaciones de estado (`/health`).
+- **`/predictions`**: Guardado y consulta de predicciones.
+- **`/peers`**: Endpoint interno para sincronización de metadatos entre nodos DB.
+- **`/trainings`**: Creación y gestión de entrenamientos.
 
-Encargados de procesar y darle respuesta a las peticiones de los workers u otros DataBases. ( son los procesos detrás de los endpoints que exponen).
+### 2. Middleware de Descubrimiento (`_discover_ips`)
+- **Frecuencia**: Cada 10 segundos.
+- **Función**: Resuelve el nombre de dominio del servicio (DNS de Docker) para encontrar nuevas IPs de nodos DataBase y actualiza una caché local. Verifica la salud de los nodos conocidos mediante peticiones HTTP a `/health`.
 
-Cuando un DataBase recibe una petición primeramente mira si el es capaz de realizarla (si tiene los datos necesarios guardados localmente) en caso de no poder busca un nodo que si pueda (a través de las tablas de rutas) y le realiza la petición a ese nodo.
+### 3. Sincronización de Metadatos (`_sync_loop`)
+- **Frecuencia**: Cada 7-10 segundos.
+- **Función**: Intercambia el objeto `PeerMetadata` con otros nodos sanos. Esto permite que cada nodo sepa qué datos (datasets, modelos) posee cada par en la red.
+- **Lógica de Merge**: Al recibir metadatos de otro par, se fusionan las listas de nodos poseedores y se actualizan los registros CSV locales si el par tiene información más reciente.
 
-####  2. Descubrimiento: 
+### 4. Monitor de Replicación (`_replication_monitor`)
+- **Frecuencia**: Cada 20 segundos.
+- **Función**: Verifica si los recursos (datasets, modelos, predicciones) cumplen con el `REPLICATION_FACTOR` (por defecto 3).
+- **Coordinación**: Si un recurso está sub-replicado, **solo el nodo poseedor con la IP más baja** inicia la replicación hacia otros nodos disponibles. Esto evita que múltiples nodos intenten replicar el mismo dato simultáneamente.
 
-Hilo que se encarga a través del DNS de Docker de saber que nodos DataBase están activos.
+### 5. Persistencia de Metadatos (`_persist_loop`)
+- **Frecuencia**: Cada 5 segundos.
+- **Función**: Guarda el estado actual de `PeerMetadata` en disco (`peer_metadata.json`) para recuperar el conocimiento de la red en caso de reinicio.
 
-Mantiene una tabla con todos los nodos del sistemas (incluso los que no están activos), y a cada uno le asocia una variable health (bool que dice si está activo o no).
+## Modelos de Datos
 
-#### 3. Coordinación: 
+El sistema utiliza una combinación de archivos CSV para metadatos y archivos JSON/CSV para datos voluminosos:
 
-Para coordinarse, los DataBases necesitan saber que nodos guardan cada dato, y esto lo hacen compartiendo unas tablas (llamadas tablas de rutas), las cuales precisamente relacionan los **ids** de los datos con las **ips** de los nodos que almacenan la información de dichos datos.
+### Datasets
+- **Metadatos**: `datasets.csv` (ID, número de batches).
+- **Datos**: Archivos CSV particionados: `{dataset_id}_batch_{n}.csv`.
+- **Almacenamiento**: Carpeta `data/datasets/`.
 
-El sistema busca que entodo momento los nodos tengan las tablas lo más actualizado posible, por lo que cada vez que ocurre un cambio en alguna de las tablas el nodo que realizó el cambio la comparte con el resto de nodos.
+### Modelos
+- **Metadatos**: `models.csv`. Contiene el estado global y métricas.
+  - Campos clave: `model_id`, `status` (pending, training, completed), `health` (timestamp), `metrics...`.
+- **Datos**: Archivos JSON serializados: `{model_id}.json`. Contiene los parámetros del modelo entrenado.
+- **Almacenamiento**: Carpeta `data/models/`.
 
-Notemos que las tablas de ruta solo cambian en dos situaciones específicas:
-- Cuando se agrega un nuevo dato al sistema.
-- Cuando falla algún nodo.
+### Entrenamientos
+- **Metadatos**: `trainings.csv`. Agrupa múltiples modelos bajo un mismo experimento.
+  - Campos: `training_id`, `dataset_id`, `type`, `status`.
 
-Para el caso en que se agrega un nuevo dato al sistema el nodo DataBase que recibió la petición simplemente guarda el dato e inicia un proceso de replicación del dato. Una vez terminadas las replicaciones actualiza sus tablas de rutas y se las comparte a los demás nodos, para que la actualicen.
+### Predicciones
+- **Metadatos**: Se registran en `models.csv` con `task="prediction"`.
+- **Datos**: Archivos JSON: `{model_id}_{dataset_id}.json`.
+- **Almacenamiento**: Carpeta `data/predictions/`.
 
-Para el caso en que falla un nodo (o varios nodos):
+## Mecanismo de Coordinación
 
-Primero definamos como **"dueño de un dato"** al nodo de la red que está activo y es el de menor ip que almacena el dato.
+El sistema utiliza un mecanismo de **Heartbeat y Locking Optimista** para coordinar el trabajo de los Workers sin un servidor central de bloqueos.
 
-Cada nodo DataBase mantiene en ejecución un hilo que con ayuda de la lista de ips activos que proporciona el descubrimiento y con las tablas de rutas, se encarga de verificar si un dato no está replicado la cantidad de veces necesarias en nodos activos, y en caso de que un dato no lo esté solo el dueño de dicho dato iniciará un proceso de replicación, actualizará sus tablas de rutas y las compartirá con el resto de nodos.
+### Campo `health`
+En `models.csv`, cada modelo tiene un campo `health` que es un timestamp ISO.
+- **Bloqueo**: Cuando un Worker toma un modelo para entrenar, el DataBase actualiza `health` al tiempo actual.
+- **Heartbeat**: El Worker envía periódicamente señales que actualizan este timestamp.
 
+### Asignación de Tareas (`get_model_to_run`)
+Cuando un Worker pide trabajo (`/models/torun`), el DataBase busca en `models.csv`:
+1. Modelos con `status != completed`.
+2. Que cumplan una de dos condiciones:
+   - Nunca han sido tocados (health inválido/vacío).
+   - Su `health` es **mayor a 20 segundos** en el pasado (indicando que el Worker anterior murió o abandonó la tarea).
 
-#### 4. Replicacion:
+Si encuentra uno, actualiza su `health` inmediatamente (lo "reserva") y lo devuelve al Worker.
 
-El proceso de replicación está directamente vinculado al proceso de coordinación ya que solo lo inicia dicho proceso.
+## Tolerancia a Fallos
 
-Este proceso recibe un dato y emplea las tablas de rutas y en los nodos activos para copiar el dato a nodos activos que no lo tengan mientras sea posible o hasta que alcance la cantidad de replicaciones necesarias para garantizar la tolerancias a fallos del sistema.
+### Fallo de Worker
+Si un Worker muere mientras entrena:
+1. Deja de enviar heartbeats.
+2. El campo `health` del modelo en el DataBase envejece.
+3. Después de 20 segundos, `find_model_to_run` considera el modelo como "abandonado" y se lo asigna a otro Worker.
 
-A medida que va copiando los datos actualiza las tablas de rutas para que luego el proceso de coordinación se encargue de compartirlas.
+### Fallo de DataBase
+Si un nodo DataBase cae:
+1. **Descubrimiento**: Los otros nodos detectan la caída mediante `check_ip_alive`.
+2. **Limpieza**: Se ejecuta `cleanup_dead_peers`, eliminando al nodo caído de las listas de poseedores en `PeerMetadata`.
+3. **Auto-Curación**: El `_replication_monitor` detecta que los datos que tenía ese nodo ahora tienen `replicas < REPLICATION_FACTOR`.
+4. **Re-replicación**: Los nodos sobrevivientes que tienen copias de esos datos inician la replicación hacia otros nodos sanos para restaurar el factor de seguridad.
 
+### Consistencia Eventual
+- **Merge de CSVs**: Al sincronizar metadatos, las filas de los CSVs se fusionan. Para `models.csv`, si hay conflicto, gana el estado `COMPLETED` o el timestamp `health` más reciente.
+- **Comparación de Versiones**: Antes de servir un modelo (`GET /models/{id}`), el nodo verifica con sus pares si alguien tiene una "mejor" versión (ej. más entrenada o con más predicciones) y se actualiza a sí mismo si es necesario.
 
-#### 5. Consistencia:
+## Diagramas
 
-La cosistencia se basa en tratar de que todos los nodos que almacenan un dato tengan la misma versión del mismo.
+### Flujo Worker ↔ DataBase (Entrenamiento)
 
-Para ello cada nodo DataBase tiene un hilo que verifica cada cierto tiempo si es el dueño de un dato, y en caso de serlo verifica las versiones del dato en los nodos que lo tienen replicado, si todas las versiones son las mismas no hay problema, pero en caso de haber diferencias (solo pueden haber en los modelos ya que los trainings y los datasets no se cambian nunca) realiza un "merge".
+```ascii
+   Worker                                  DataBase
+     |                                         |
+     | 1. GET /models/torun                    |
+     |---------------------------------------->|
+     |                                         | 2. Busca modelo con health > 20s
+     |                                         | 3. Actualiza health = now()
+     | 4. Retorna ModelToRun (id, dataset...)  |
+     |<----------------------------------------|
+     |                                         |
+     | 5. Inicia Entrenamiento                 |
+     |                                         |
+     |          (Loop cada 10s)                |
+     | 6. GET /models/health/{id} (Heartbeat)  |
+     |---------------------------------------->|
+     |                                         | 7. Actualiza health = now()
+     |                                         |
+     | 8. POST /models/{id} (Guardar Modelo)   |
+     |---------------------------------------->|
+     |                                         | 9. Guarda JSON y actualiza status=completed
+     |                                         | 10. Inicia replicación a otros DBs
+```
 
-El "merge" de los modelos se hace teniendo en cuenta la información de los batches por los que se quedaron entrenando y por los que se quedaron prediciendo y prioriza siempre la información del modelo que se quedó por el mayor batch; ya que los entrenamientos y las predicciones se realizan secuencialmente sobre los batches y todos los modelos del mismo tipo se inicializan usando la misma semilla.
+### Flujo DataBase ↔ DataBase (Replicación)
 
-Una vez hecho el "merge" le enváa el nuevo dato al resto de los que tenian las réplicas.
+```ascii
+   DB_Node_A (Dueño)                       DB_Node_B (Destino)
+     |                                         |
+     | (Replication Monitor detecta falta)     |
+     |                                         |
+     | 1. POST /datasets/replicate             |
+     |    {file, dataset_id}                   |
+     |---------------------------------------->|
+     |                                         | 2. Guarda archivo localmente
+     |                                         | 3. Actualiza PeerMetadata local
+     | 4. 200 OK                               |
+     |<----------------------------------------|
+     |                                         |
+     | 5. Actualiza PeerMetadata local         |
+     |    (Marca a Node_B como poseedor)       |
+```
 
-### Tolerancia a fallas de los DataBases:
+## Comunicación y Protocolos
 
-Los DataBases presentan una tolerancia 2(por defecto) a fallos o desconexiones temporales de nodos, pero si se aumenta el factor de replicación también aumentaría el factor de tolerancia a fallos.
+La arquitectura del sistema se basa en un modelo de comunicación **estrictamente HTTP/REST**, eliminando la necesidad de conexiones persistentes o sockets con estado entre los componentes (Workers, DataBases y Clientes).
 
-Para los DataBases una partición de la red no representa ningún problema ya que sería igual a que fallen muchos nodos a la vez, es decir siempre que no fallen todos los nodos que tienen un dato guardado el sistema seguirá funcionando de manera correcta.
+### Características Principales:
+- **Desacoplamiento Total**: Cada nodo opera de forma autónoma. La caída o reinicio de un componente no afecta las conexiones de los demás.
+- **API REST**: Tanto Workers como DataBases exponen interfaces RESTful estandarizadas para el intercambio de datos y comandos de control.
+- **Escalabilidad**: Al no mantener estado en la capa de transporte, es posible agregar o quitar nodos dinámicamente sin reconfigurar la red.
 
-Al desconectarse un nodo temporalmente, si en el tiempo que se desconectó, el líder de los datos que almacenaba el nodo caído se da cuenta inicia automaticamente el proceso de replicación y al volver nuevamente el nodo habrán más nodos con el dato de los que había antes de la caída del nodo, lo cual no es malo ya que a partir de ese momento dichos datos tendrán mas tolerancia a fallos, para si en el futuro el nodo (u otro nodo) presenta fallos ya no habria que replicar nada. 
+## Descubrimiento y Localización de Servicios
 
-En caso de que hubiera un cambio en los datos mientras el nodo no estaba disponible, al volver a unirse a la red el proceso de consistencia eventualmente se dará cuenta y el líder hara el merge de los datos y luego la replicación del mismo, con lo cual se lograría la consistencia nuevamente. Con esto se cubriría tambien el caso de que ocurra una partición de la red ya que es análogo a que muchos nodos se desconecten temporalmente a la vez.
+Para garantizar la alta disponibilidad y la resiliencia ante fallos de red, el sistema implementa una estrategia de descubrimiento híbrida:
 
-Cuando un nodo se agrega nuevo a la red, eventualmente le tocará replicar un dato o le tocará agregar un nuevo dato al sistema, pero mientras tanto sirve como router para las peticiones de los Workers, por lo que tampoco presenta ningún problema para el sistema.
+### 1. Resolución DNS (Mecanismo Primario)
+El sistema aprovecha el **DNS interno de Docker Swarm**.
+- **Resolución Automática**: Los nodos resuelven los nombres de servicio (ej. `dml-db`) para obtener las IPs de las instancias activas.
+- **Balanceo de Carga**: Docker distribuye las peticiones entre los contenedores disponibles.
+- **Aislamiento**: Permite que los nodos desconozcan la topología física de la red.
 
-## Comunicación
+### 2. Caché de IPs (Mecanismo de Respaldo)
+Para mitigar posibles fallos o latencias en el servicio DNS, cada nodo mantiene una tabla de enrutamiento local (`ip_cache`) gestionada por el Middleware.
 
-La comunicación entre todos los componentes del sistema (workers, nodos DataBase y clientes) se realiza exclusivamente mediante peticiones HTTP. 
+**Ciclo de Vida de la Caché:**
+1. **Inicialización**: Carga IPs semilla preconfiguradas para garantizar conectividad inmediata al arranque.
+2. **Aprendizaje Continuo**: Al descubrir un nuevo nodo sano (vía DNS o interacción directa), su IP se añade a la caché.
+3. **Failover**: Si la resolución DNS falla, el sistema conmuta automáticamente al uso de IPs en caché.
+4. **Auto-limpieza**: Un proceso de *Health Check* elimina proactivamente las IPs que dejan de responder, manteniendo la lista de pares depurada.
 
-Esto debido a que cada nodo (excepto los clientes) expone una API REST que permite intercambiar datos y coordinar las operaciones distribuidas sin necesidad de mantener conexiones persistentes. Y tambien gracias a que todos los procesos del sistema son independientes y no necesitan mantener una conexión.
+## Topología y Distribución
 
-Gracias a este enfoque, los nodos se mantienen desacoplados, pueden operar de forma independiente y es posible reemplazarlos, escalarlos o reiniciarlos sin afectar el funcionamiento global del sistema.
+Esta arquitectura distribuida permite que el sistema opere de manera funcional con una topología mínima de **un nodo Worker y un nodo DataBase**, escalando horizontalmente según la demanda y garantizando la continuidad del servicio incluso en escenarios de degradación parcial de la red.
 
-## Nombrado y Localización 
+## Coordinación
 
-Para que cada nodo del sistema pueda localizar a otros nodos activos dentro de la red, se utilizan dos mecanismos de descubrimiento complementarios. Esto garantiza que, si uno falla, el otro pueda actuar como respaldo, manteniendo la comunicación y la operatividad del sistema.
+El sistema implementa mecanismos de coordinación descentralizada para garantizar la consistencia y evitar condiciones de carrera sin depender de un coordinador central único.
 
-### Domain Name Service (DNS)
+### Sincronización de Acciones
+- **Workers**: Utilizan un mecanismo de **Heartbeat** para coordinar la asignación de tareas. No se comunican entre sí, sino que utilizan el estado compartido en los DataBases como medio de sincronización indirecta.
+- **DataBases**: Se coordinan mediante el intercambio periódico de metadatos (`PeerMetadata`). Cada nodo informa a sus pares sobre los datos que posee, permitiendo que la red converja hacia un estado consistente.
 
-El sistema se ejecuta sobre una red de Docker utilizando Docker Swarm, que proporciona un DNS interno capaz de resolver automáticamente los nombres de servicio de cada nodo.
+### Acceso Exclusivo a Recursos (Locking Optimista)
+Para evitar que múltiples Workers entrenen el mismo modelo simultáneamente, se utiliza un sistema de bloqueo basado en timestamps (`health`):
+1. **Adquisición**: Un Worker solicita un modelo (`get_model_to_run`). El DataBase verifica si el modelo está libre (health > 20s) y actualiza el timestamp al momento actual, "reservándolo" efectivamente.
+2. **Mantenimiento**: El Worker envía heartbeats cada 10s para renovar su reserva.
+3. **Liberación**: Al finalizar, el estado cambia a `COMPLETED`. Si el Worker falla, el timestamp envejece y el recurso se libera automáticamente tras 20s (timeout).
 
-Gracias a este DNS:
+### Toma de Decisiones Distribuidas
+- **Replicación**: La decisión de quién replica un dato faltante se toma de forma determinista y descentralizada. Solo el nodo poseedor con la **IP más baja** (menor orden lexicográfico) inicia la replicación, evitando duplicidad de esfuerzos.
+- **Consistencia**: En caso de conflicto de versiones de metadatos, todos los nodos aplican la misma regla de resolución (prioridad a estado `COMPLETED` o timestamp más reciente), garantizando convergencia sin votación explícita.
 
-- Los nodos no necesitan conocer direcciones IP específicas.
-- Un worker puede comunicarse con los nodos DataBase simplemente usando su dominio o nombre de servicio.
-- Docker gestiona la resolución y el balanceo entre instancias activas.
-- Los fallos de nodos individuales quedan aislados del resto del sistema.
-- Este mecanismo es la forma principal de descubrimiento dentro de la red.
+## Consistencia y Replicación
 
-### IP Cache
+El sistema prioriza la disponibilidad y la tolerancia a particiones (AP en el teorema CAP), garantizando consistencia eventual.
 
-Como mecanismo de respaldo, cada nodo mantiene una caché local de direcciones IP correspondientes a otros nodos conocidos. Está técnica funciona incluso si la resolución por DNS falla.
+### Distribución de Datos
+Los datos se distribuyen en la red de DataBases. No todos los nodos tienen todos los datos, pero el sistema garantiza que existan suficientes copias para asegurar la disponibilidad.
+- **Datasets**: Se almacenan particionados en archivos batch.
+- **Modelos**: Se almacenan como archivos JSON serializados.
+- **Predicciones**: Se guardan en archivos JSON asociados a modelos y datasets.
 
-### El funcionamiento es el siguiente:
+### Replicación
+- **Factor de Replicación**: El sistema mantiene por defecto **3 réplicas** (`REPLICATION_FACTOR = 3`) de cada dataset, modelo y predicción.
+- **Mecanismo**: Un hilo de monitoreo (`_replication_monitor`) verifica periódicamente si los datos cumplen con el factor de replicación. Si detecta déficit, inicia la copia hacia nodos disponibles.
 
-**IPs fijas al iniciar el nodo:**
+### Confiabilidad tras Actualización
+- **Metadatos**: La propagación de metadatos es epidémica (gossip-like). Un cambio en un nodo se propaga a los demás en los siguientes ciclos de sincronización (cada 7-10s).
+- **Datos Voluminosos**: La replicación de archivos es asíncrona. Durante el breve periodo de propagación, es posible que algunos nodos no tengan la última versión, pero el mecanismo de descubrimiento de "mejor versión" mitiga el impacto de leer datos obsoletos.
 
-Cuando un nodo se levanta, carga en su caché un conjunto de IPs fijas preconfiguradas.
-Esto le permite tener acceso inmediato a nodos potenciales, incluso si el DNS presenta fallos desde el inicio.
+## Tolerancia a Fallas
 
-**Actualización dinámica:**
+El sistema está diseñado para operar en entornos inestables, asumiendo que los fallos son la norma y no la excepción.
 
-A medida que el nodo interactúa con otros, añade nuevas IPs a la caché cuando detecta nodos que responden correctamente.
+### Nivel de Tolerancia
+- **Workers**: Tolerancia a fallos total mientras quede al menos 1 Worker activo ($N-1$).
+- **DataBases**: Tolerancia a la caída de $R-1$ nodos por dato, donde $R$ es el factor de replicación (por defecto 3). El sistema sigue operativo globalmente mientras exista al menos 1 nodo DataBase, aunque algunos datos específicos podrían no estar disponibles si se pierden todas sus réplicas.
 
-**Uso como respaldo:**
+### Respuesta a Errores
+- **Timeouts**: Todas las comunicaciones internas tienen timeouts configurados para evitar bloqueos indefinidos.
+- **Reintentos**: Los clientes y nodos reintentan operaciones fallidas contra otros nodos disponibles.
+- **Auto-Curación**: El sistema detecta nodos caídos y re-replica automáticamente los datos perdidos para recuperar el nivel de redundancia.
 
-Si el DNS no funciona o la red presenta inconsistencias, el nodo reutiliza las IPs guardadas en la caché para intentar conectarse a otros nodos activos.
+### Fallos Parciales y Recuperación
+- **Nodos Caídos Temporalmente**: Si un nodo cae y vuelve, recupera su estado mediante la sincronización de metadatos con sus pares.
+- **Nodos Nuevos**: Se integran automáticamente al ser descubiertos por el DNS/Gossip, recibiendo metadatos y participando eventualmente en el almacenamiento de nuevas réplicas.
 
-**Depuración automática:**
+## Seguridad
 
-Si una IP en la caché deja de ser válida, se descarta al detectar fallos consecutivos.
+### Seguridad en la Comunicación
+- **Protocolo**: Actualmente la comunicación es HTTP plano. En entornos de producción, se recomienda el despliegue detrás de un proxy inverso o malla de servicios que provea terminación TLS/SSL para cifrar el tráfico entre nodos.
+- **Aislamiento de Red**: El diseño asume que el tráfico entre Workers y DataBases ocurre dentro de una red privada confiable (ej. red overlay de Docker Swarm), no expuesta directamente a internet pública.
 
-Gracias a está combinación, el sistema puede arrancar, operar y recuperarse incluso en momentos donde la infraestructura de red esté parcialmente degradada.
+### Seguridad del Diseño
+- **Validación de Datos**: Todos los endpoints utilizan esquemas Pydantic estrictos para validar la estructura y tipos de datos de entrada, previniendo inyección de datos malformados.
+- **Sin Ejecución de Código Remoto**: El sistema transfiere datos y modelos serializados (JSON/CSV), no código ejecutable arbitrario (como pickles de Python inseguros), mitigando riesgos de RCE.
 
-## Distribución de servicios en ambas redes de docker
-
-Dicha arquitectura permite que el sistema funcione en una red de docker siempre que exista al menos un nodo de cada tipo.
+### Autorización y Autenticación
+- **Estado Actual**: El sistema opera bajo un modelo de confianza total dentro del clúster. No implementa autenticación (tokens/usuarios) entre servicios internos.
+- **Control de Acceso**: La seguridad perimetral debe ser gestionada por la infraestructura (firewalls, security groups). El acceso de usuarios finales a la API pública debería ser mediado por un API Gateway que maneje la autenticación.
