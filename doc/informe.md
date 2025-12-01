@@ -10,7 +10,7 @@ El sistema expone una **API REST** que ofrece los servicios de entrenamiento y p
 
 1. El sistema ofrece diversos modelos de machine learning para tareas de ***regresión*** y ***clasificación.***
 
-2. Permite a los usuarios subir archivos ****.csv**** con los datasets de entrenamiento o predicción.
+2. Permite a los usuarios subir archivos **.csv** con los datasets de entrenamiento o predicción.
 
 3. Los usuarios pueden crear procesos de entrenamiento indicando:
     - el tipo de entrenamiento (regresión o clasificación). 
@@ -121,26 +121,26 @@ Para evitar que dos Workers procesen el mismo modelo simultáneamente, el sistem
 ### Funcionamiento del Mecanismo:
 
 
-```
-┌─────────────┐                      ┌─────────────┐
-│   Worker    │                      │  DataBase   │
-│  (Runner)   │                      │             │
-└──────┬──────┘                      └──────┬──────┘
-       │                                    │
-       │  1. get_model_to_run()             │
-       │  (health > 20 segundos)            │
-       │───────────────────────────────────>│
-       │                                    │
-       │  2. ModelToRun(model_id,           │
-       │     running_type, dataset_id)      │
-       │<───────────────────────────────────│
-       │                                    │
-       │  3. send_model_running_status()    │
-       │     (cada 10s desde status thread) │
-       │───────────────────────────────────>│
-       │                                    │
-       │  4. Actualiza health = now()       │
-       │                                    │
+```ascii
+ -------------
+|   Worker    |                       -------------
+|  (Runner)   |                      |  DataBase   |
+ ------┬------                        ------┬------ 
+       |                                    |
+       |  1. get_model_to_run()             |
+       |  (health > 20 segundos)            |
+       |----------------------------------->|
+       |                                    |
+       |  2. ModelToRun(model_id,           |
+       |     running_type, dataset_id)      |
+       |<-----------------------------------|
+       |                                    |
+       |  3. send_model_running_status()    |
+       |     (cada 10s desde status thread) |
+       |----------------------------------->|
+       |                                    |
+       |  4. Actualiza health = now()       |
+       |                                    |
 ```
 
 ### Etapas del Proceso:
