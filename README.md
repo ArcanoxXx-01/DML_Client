@@ -2,4 +2,4 @@
 
 DistIA Client, a distributed AI model training system.
 
-docker swarm join --token SWMTKN-1-4zyn2s7m97clov3j0wbyrgpbh3ibu6ezev75whsh8krnsvkqv4-5h8n6cpw2w3s28s4eukzd6zns 10.215.155.231:2377
+docker swarm join --token SWMTKN-1-1xpx61k7ytshlnnsfp2lxpyzn2900b5tudq143edtj5duldu1e-6c89eywy0syweskgzd1hq37up 10.6.121.39:2377
